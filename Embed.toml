@@ -1,0 +1,13 @@
+[default.general]
+chip = "esp32s3"
+connect_under_reset = false
+
+[default.probe]
+protocol = "Jtag"
+
+[default.rtt]
+enabled = false
+
+[default.gdb]
+enabled = true
+gdb_connection_string = "127.0.0.1:1337"
