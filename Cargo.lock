@@ -1058,6 +1058,7 @@ dependencies = [
  "esp-radio",
  "esp-rtos",
  "heapless 0.8.0",
+ "qrcode",
 ]
 
 [[package]]
@@ -1316,6 +1317,11 @@ checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "git+https://github.com/kennytm/qrcode-rust.git?rev=c7780e8549ac4fb3da81fdf7d7f010a27db78c0f#c7780e8549ac4fb3da81fdf7d7f010a27db78c0f"
 
 [[package]]
 name = "quote"
