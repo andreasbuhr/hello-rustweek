@@ -7,16 +7,34 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
-use esp_hal::clock::CpuClock;
-use esp_hal::delay::Delay;
-use esp_hal::dma::DmaTxBuf;
-use esp_hal::dma_tx_buffer;
-use esp_hal::gpio::{Level, Output, OutputConfig};
-use esp_hal::lcd_cam::lcd::i8080::{Config, I8080};
-use esp_hal::lcd_cam::LcdCam;
-use esp_hal::time::Rate;
-use esp_hal::{Blocking, main};
-use qrcode::{Color, QrCode};
+extern crate alloc;
+
+use core::convert::Infallible;
+use core::fmt::Write;
+
+use embassy_executor::Spawner;
+use embassy_time::{Duration, Timer};
+use embedded_graphics::{
+    mono_font::{ascii::FONT_8X13, MonoTextStyleBuilder},
+    pixelcolor::Rgb565,
+    prelude::*,
+    primitives::Rectangle,
+    text::Text,
+};
+use esp_hal::{
+    clock::CpuClock,
+    delay::Delay,
+    dma::DmaTxBuf,
+    dma_tx_buffer,
+    gpio::{Level, Output, OutputConfig},
+    interrupt::software::SoftwareInterruptControl,
+    lcd_cam::{lcd::i8080::{Config, I8080}, LcdCam},
+    time::Rate,
+    timer::timg::TimerGroup,
+    Blocking,
+};
+use esp_radio::wifi::{AuthenticationMethod, scan::ScanConfig};
+use heapless::String as HString;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -32,7 +50,6 @@ const HEIGHT: u16 = 320;
 const COL_OFFSET: u16 = 35;
 
 const WHITE: u16 = 0xFFFF;
-const BLACK: u16 = 0x0000;
 
 struct Bus<'d> {
     resources: Option<(I8080<'d, Blocking>, DmaTxBuf)>,
@@ -90,50 +107,111 @@ impl<'d> Bus<'d> {
 
         self.resources = Some((i8080, buf));
     }
+}
 
-    /// Render a QR code centered on the display.
-    /// `colors` is the flat row-major slice from `QrCode::into_colors()`.
-    fn draw_qr(&mut self, colors: &[Color], qr_modules: usize, module_size: usize) {
-        let qr_pixels = qr_modules * module_size;
+impl DrawTarget for Bus<'_> {
+    type Color = Rgb565;
+    type Error = Infallible;
 
-        // Center within the physical panel
-        let margin_x = (WIDTH as usize - qr_pixels) / 2;
-        let margin_y = (HEIGHT as usize - qr_pixels) / 2;
-        let x0 = COL_OFFSET + margin_x as u16;
-        let y0 = margin_y as u16;
-
-        self.set_window(x0, y0, x0 + qr_pixels as u16 - 1, y0 + qr_pixels as u16 - 1);
-
-        let (mut i8080, mut buf) = self.resources.take().unwrap();
-        let row_bytes = qr_pixels * 2;
-        let mut first = true;
-
-        for qr_row in 0..qr_modules {
-            // Build one scaled display row in the DMA buffer
-            {
-                let slice = buf.as_mut_slice();
-                let mut idx = 0;
-                for qr_col in 0..qr_modules {
-                    let pixel = colors[qr_row * qr_modules + qr_col].select(BLACK, WHITE);
-                    let [hi, lo] = pixel.to_be_bytes();
-                    for _ in 0..module_size {
-                        slice[idx] = hi;
-                        slice[idx + 1] = lo;
-                        idx += 2;
-                    }
-                }
-            }
-            buf.set_length(row_bytes);
-
-            // Repeat each module row vertically
-            for _ in 0..module_size {
-                let cmd = if first { first = false; 0x2C_u8 } else { 0x3C_u8 };
-                (_, i8080, buf) = i8080.send(cmd, 0, buf).unwrap().wait();
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(Point { x, y }, color) in pixels {
+            if x >= 0 && x < WIDTH as i32 && y >= 0 && y < HEIGHT as i32 {
+                let px = x as u16 + COL_OFFSET;
+                let py = y as u16;
+                let rgb = color.into_storage();
+                self.set_window(px, py, px, py);
+                self.send(0x2C, &[(rgb >> 8) as u8, rgb as u8]);
             }
         }
+        Ok(())
+    }
 
-        buf.set_length(buf.capacity());
-        self.resources = Some((i8080, buf));
+    // Efficient batch implementation: one set_window + one DMA burst per fill_contiguous call.
+    // Called by MonoTextStyle when background_color is set (Both<text, bg> path in embedded-graphics).
+    fn fill_contiguous<I>(&mut self, area: &Rectangle, colors: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Self::Color>,
+    {
+        let display = Rectangle::new(Point::zero(), Size::new(WIDTH as u32, HEIGHT as u32));
+        let clipped = area.intersection(&display);
+
+        if clipped.size == Size::zero() {
+            // Consume iterator to satisfy the contract, then bail.
+            for _ in colors {}
+            return Ok(());
+        }
+
+        if clipped == *area {
+            // Fast path: area fully within display — stream all pixels in one window.
+            let x0 = area.top_left.x as u16 + COL_OFFSET;
+            let y0 = area.top_left.y as u16;
+            let x1 = x0 + area.size.width as u16 - 1;
+            let y1 = y0 + area.size.height as u16 - 1;
+            self.set_window(x0, y0, x1, y1);
+
+            let (mut i8080, mut buf) = self.resources.take().unwrap();
+            let capacity = buf.capacity();
+            let mut idx = 0usize;
+            let mut first = true;
+
+            for color in colors {
+                let rgb = color.into_storage();
+                {
+                    let slice = buf.as_mut_slice();
+                    slice[idx] = (rgb >> 8) as u8;
+                    slice[idx + 1] = rgb as u8;
+                }
+                idx += 2;
+                if idx >= capacity {
+                    buf.set_length(capacity);
+                    let cmd = if first { first = false; 0x2C_u8 } else { 0x3C_u8 };
+                    (_, i8080, buf) = i8080.send(cmd, 0, buf).unwrap().wait();
+                    idx = 0;
+                }
+            }
+            if idx > 0 {
+                buf.set_length(idx);
+                let cmd = if first { 0x2C_u8 } else { 0x3C_u8 };
+                (_, i8080, buf) = i8080.send(cmd, 0, buf).unwrap().wait();
+            }
+            buf.set_length(capacity);
+            self.resources = Some((i8080, buf));
+        } else {
+            // Slow path: area partially outside — filter per pixel.
+            self.draw_iter(
+                area.points()
+                    .zip(colors)
+                    .filter(|(pt, _)| clipped.contains(*pt))
+                    .map(|(pt, color)| Pixel(pt, color)),
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+impl OriginDimensions for Bus<'_> {
+    fn size(&self) -> Size {
+        Size::new(WIDTH as u32, HEIGHT as u32)
+    }
+}
+
+fn auth_str(method: &Option<AuthenticationMethod>) -> &'static str {
+    match method {
+        None => "?",
+        Some(AuthenticationMethod::None) => "Open",
+        Some(AuthenticationMethod::Wep) => "WEP",
+        Some(AuthenticationMethod::Wpa) => "WPA",
+        Some(AuthenticationMethod::Wpa2Personal) | Some(AuthenticationMethod::WpaWpa2Personal) => {
+            "WPA2"
+        }
+        Some(AuthenticationMethod::Wpa3Personal) | Some(AuthenticationMethod::Wpa2Wpa3Personal) => {
+            "WPA3"
+        }
+        Some(_) => "Other",
     }
 }
 
@@ -141,12 +219,16 @@ impl<'d> Bus<'d> {
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
 )]
-#[main]
-fn main() -> ! {
-    esp_alloc::heap_allocator!(size: 32 * 1024);
+#[esp_rtos::main]
+async fn main(_spawner: Spawner) -> ! {
+    esp_alloc::heap_allocator!(size: 72 * 1024);
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
+
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
 
     let delay = Delay::new();
 
@@ -191,24 +273,71 @@ fn main() -> ! {
     delay.delay_millis(10);
     bus.send(0x3A, &[0x55]); // COLMOD: RGB565
     bus.send(0x36, &[0x00]); // MADCTL: portrait, RGB order
-    bus.send(0x21, &[]);     // INVON: inversion on (required for correct colors)
+    bus.send(0x21, &[]);     // INVON
     bus.send(0x13, &[]);     // NORON
     bus.send(0x29, &[]);     // DISPON
     delay.delay_millis(10);
 
     backlight.set_high();
-
-    // Generate QR code
-    let code = QrCode::new(b"https://github.com/andreasbuhr/hello-rustweek").unwrap();
-    let qr_modules = code.width();
-    // Largest integer scale that fits in the narrower display dimension
-    let module_size = (WIDTH as usize / qr_modules).max(1);
-    let colors = code.into_colors();
-
     bus.fill_screen(WHITE);
-    bus.draw_qr(&colors, qr_modules, module_size);
+
+    // Init WiFi — new() starts the driver in STA mode automatically.
+    let (mut controller, _interfaces) =
+        esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();
+
+    let text_style = MonoTextStyleBuilder::new()
+        .font(&FONT_8X13)
+        .text_color(Rgb565::BLACK)
+        .background_color(Rgb565::WHITE)
+        .build();
 
     loop {
-        delay.delay_millis(1_000);
+        let results = controller
+            .scan_async(&ScanConfig::default())
+            .await
+            .unwrap_or_default();
+
+        if results.is_empty() {
+            bus.fill_screen(WHITE);
+            Text::new("No networks found", Point::new(5, 20), text_style)
+                .draw(&mut bus)
+                .ok();
+            Timer::after(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        for ap in &results {
+            bus.fill_screen(WHITE);
+
+            // Line 1: SSID (up to 21 chars at 8px/char fits 168 of 170px)
+            let mut line: HString<32> = HString::new();
+            write!(line, "{}", ap.ssid.as_str()).ok();
+            Text::new(&line, Point::new(5, 20), text_style)
+                .draw(&mut bus)
+                .ok();
+
+            // Line 2: signal strength
+            line.clear();
+            write!(line, "RSSI: {} dBm", ap.signal_strength).ok();
+            Text::new(&line, Point::new(5, 40), text_style)
+                .draw(&mut bus)
+                .ok();
+
+            // Line 3: channel
+            line.clear();
+            write!(line, "Channel: {}", ap.channel).ok();
+            Text::new(&line, Point::new(5, 60), text_style)
+                .draw(&mut bus)
+                .ok();
+
+            // Line 4: auth method
+            line.clear();
+            write!(line, "Auth: {}", auth_str(&ap.auth_method)).ok();
+            Text::new(&line, Point::new(5, 80), text_style)
+                .draw(&mut bus)
+                .ok();
+
+            Timer::after(Duration::from_secs(1)).await;
+        }
     }
 }
