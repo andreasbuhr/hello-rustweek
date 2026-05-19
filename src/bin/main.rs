@@ -16,6 +16,7 @@ use esp_hal::lcd_cam::lcd::i8080::{Config, I8080};
 use esp_hal::lcd_cam::LcdCam;
 use esp_hal::time::Rate;
 use esp_hal::{Blocking, main};
+use qrcode::{Color, QrCode};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -29,6 +30,9 @@ esp_bootloader_esp_idf::esp_app_desc!();
 const WIDTH: u16 = 170;
 const HEIGHT: u16 = 320;
 const COL_OFFSET: u16 = 35;
+
+const WHITE: u16 = 0xFFFF;
+const BLACK: u16 = 0x0000;
 
 struct Bus<'d> {
     resources: Option<(I8080<'d, Blocking>, DmaTxBuf)>,
@@ -47,6 +51,90 @@ impl<'d> Bus<'d> {
         let (_, i8080, buf) = i8080.send(cmd, 0, buf).unwrap().wait();
         self.resources = Some((i8080, buf));
     }
+
+    fn set_window(&mut self, x0: u16, y0: u16, x1: u16, y1: u16) {
+        self.send(0x2A, &[
+            (x0 >> 8) as u8, x0 as u8,
+            (x1 >> 8) as u8, x1 as u8,
+        ]);
+        self.send(0x2B, &[
+            (y0 >> 8) as u8, y0 as u8,
+            (y1 >> 8) as u8, y1 as u8,
+        ]);
+    }
+
+    fn fill_screen(&mut self, color: u16) {
+        self.set_window(COL_OFFSET, 0, COL_OFFSET + WIDTH - 1, HEIGHT - 1);
+
+        let (mut i8080, mut buf) = self.resources.take().unwrap();
+        let color_bytes = color.to_be_bytes();
+        for chunk in buf.as_mut_slice().chunks_mut(2) {
+            chunk.copy_from_slice(&color_bytes);
+        }
+        buf.set_length(buf.capacity());
+
+        let mut bytes_remaining = WIDTH as usize * HEIGHT as usize * 2;
+
+        (_, i8080, buf) = i8080.send(0x2C_u8, 0, buf).unwrap().wait(); // RAMWR
+        bytes_remaining -= buf.len();
+
+        while bytes_remaining >= buf.len() {
+            (_, i8080, buf) = i8080.send(0x3C_u8, 0, buf).unwrap().wait(); // RAMWRC
+            bytes_remaining -= buf.len();
+        }
+        if bytes_remaining > 0 {
+            buf.set_length(bytes_remaining);
+            (_, i8080, buf) = i8080.send(0x3C_u8, 0, buf).unwrap().wait();
+        }
+        buf.set_length(buf.capacity());
+
+        self.resources = Some((i8080, buf));
+    }
+
+    /// Render a QR code centered on the display.
+    /// `colors` is the flat row-major slice from `QrCode::into_colors()`.
+    fn draw_qr(&mut self, colors: &[Color], qr_modules: usize, module_size: usize) {
+        let qr_pixels = qr_modules * module_size;
+
+        // Center within the physical panel
+        let margin_x = (WIDTH as usize - qr_pixels) / 2;
+        let margin_y = (HEIGHT as usize - qr_pixels) / 2;
+        let x0 = COL_OFFSET + margin_x as u16;
+        let y0 = margin_y as u16;
+
+        self.set_window(x0, y0, x0 + qr_pixels as u16 - 1, y0 + qr_pixels as u16 - 1);
+
+        let (mut i8080, mut buf) = self.resources.take().unwrap();
+        let row_bytes = qr_pixels * 2;
+        let mut first = true;
+
+        for qr_row in 0..qr_modules {
+            // Build one scaled display row in the DMA buffer
+            {
+                let slice = buf.as_mut_slice();
+                let mut idx = 0;
+                for qr_col in 0..qr_modules {
+                    let pixel = colors[qr_row * qr_modules + qr_col].select(BLACK, WHITE);
+                    let [hi, lo] = pixel.to_be_bytes();
+                    for _ in 0..module_size {
+                        slice[idx] = hi;
+                        slice[idx + 1] = lo;
+                        idx += 2;
+                    }
+                }
+            }
+            buf.set_length(row_bytes);
+
+            // Repeat each module row vertically
+            for _ in 0..module_size {
+                let cmd = if first { first = false; 0x2C_u8 } else { 0x3C_u8 };
+                (_, i8080, buf) = i8080.send(cmd, 0, buf).unwrap().wait();
+            }
+        }
+
+        buf.set_length(buf.capacity());
+        self.resources = Some((i8080, buf));
+    }
 }
 
 #[allow(
@@ -55,6 +143,8 @@ impl<'d> Bus<'d> {
 )]
 #[main]
 fn main() -> ! {
+    esp_alloc::heap_allocator!(size: 32 * 1024);
+
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
@@ -95,65 +185,30 @@ fn main() -> ! {
     let mut bus = Bus::new(i8080, dma_buf);
 
     // ST7789V init
-    bus.send(0x01, &[]);       // SWRESET
+    bus.send(0x01, &[]);     // SWRESET
     delay.delay_millis(150);
-    bus.send(0x11, &[]);       // SLPOUT — exit sleep
+    bus.send(0x11, &[]);     // SLPOUT
     delay.delay_millis(10);
-    bus.send(0x3A, &[0x55]);   // COLMOD — RGB565
-    bus.send(0x36, &[0x00]);   // MADCTL — portrait, RGB order
-    bus.send(0x21, &[]);       // INVON — inversion on (required for correct colors)
-    bus.send(0x13, &[]);       // NORON — normal display mode
-    bus.send(0x29, &[]);       // DISPON — display on
+    bus.send(0x3A, &[0x55]); // COLMOD: RGB565
+    bus.send(0x36, &[0x00]); // MADCTL: portrait, RGB order
+    bus.send(0x21, &[]);     // INVON: inversion on (required for correct colors)
+    bus.send(0x13, &[]);     // NORON
+    bus.send(0x29, &[]);     // DISPON
     delay.delay_millis(10);
 
     backlight.set_high();
 
-    // RGB565: R=0xF800, G=0x07E0, B=0x001F
-    const COLORS: [u16; 3] = [0xF800, 0x07E0, 0x001F];
+    // Generate QR code
+    let code = QrCode::new(b"https://github.com/andreasbuhr/hello-rustweek").unwrap();
+    let qr_modules = code.width();
+    // Largest integer scale that fits in the narrower display dimension
+    let module_size = (WIDTH as usize / qr_modules).max(1);
+    let colors = code.into_colors();
 
-    let col_end = COL_OFFSET + WIDTH - 1;
-    let row_end = HEIGHT - 1;
+    bus.fill_screen(WHITE);
+    bus.draw_qr(&colors, qr_modules, module_size);
 
-    let mut color_index = 0usize;
     loop {
-        let color = COLORS[color_index % COLORS.len()];
-        color_index = color_index.wrapping_add(1);
-
-        // Set the write window to the full panel
-        bus.send(0x2A, &[
-            (COL_OFFSET >> 8) as u8, COL_OFFSET as u8,
-            (col_end >> 8) as u8,    col_end as u8,
-        ]);
-        bus.send(0x2B, &[
-            0x00, 0x00,
-            (row_end >> 8) as u8, row_end as u8,
-        ]);
-
-        // Stream pixel data via DMA — 170*320*2 = 108 800 bytes in 4000-byte chunks
-        let (mut i8080, mut buf) = bus.resources.take().unwrap();
-        let color_bytes = color.to_be_bytes();
-        for chunk in buf.as_mut_slice().chunks_mut(2) {
-            chunk.copy_from_slice(&color_bytes);
-        }
-        buf.set_length(buf.capacity());
-
-        let mut bytes_remaining = WIDTH as usize * HEIGHT as usize * 2;
-
-        (_, i8080, buf) = i8080.send(0x2C_u8, 0, buf).unwrap().wait(); // RAMWR
-        bytes_remaining -= buf.len();
-
-        while bytes_remaining >= buf.len() {
-            (_, i8080, buf) = i8080.send(0x3C_u8, 0, buf).unwrap().wait(); // RAMWRC
-            bytes_remaining -= buf.len();
-        }
-        if bytes_remaining > 0 {
-            buf.set_length(bytes_remaining);
-            (_, i8080, buf) = i8080.send(0x3C_u8, 0, buf).unwrap().wait();
-            buf.set_length(buf.capacity());
-        }
-
-        bus.resources = Some((i8080, buf));
-
         delay.delay_millis(1_000);
     }
 }
