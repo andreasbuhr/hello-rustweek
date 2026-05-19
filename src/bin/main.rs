@@ -398,7 +398,7 @@ async fn main(_spawner: Spawner) -> ! {
                 Text::new(&line, Point::new(5, 60), text_style).draw(&mut bus).ok();
             }
 
-            Timer::after(Duration::from_secs(1)).await;
+            Timer::after(Duration::from_secs(6)).await;
         }
     }
 }
