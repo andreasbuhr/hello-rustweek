@@ -9,6 +9,8 @@
 
 extern crate alloc;
 
+use defmt_rtt as _;
+
 use core::convert::Infallible;
 use core::fmt::Write;
 
@@ -38,7 +40,8 @@ use heapless::String as HString;
 use qrcode::{Color, QrCode};
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    defmt::error!("panic: {}", defmt::Display2Format(info));
     loop {}
 }
 
@@ -273,6 +276,8 @@ fn auth_label(auth: &Option<AuthenticationMethod>) -> &'static str {
 async fn main(_spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(size: 72 * 1024);
 
+    defmt::info!("hello-rustweek booting");
+
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
@@ -343,7 +348,10 @@ async fn main(_spawner: Spawner) -> ! {
             .await
             .unwrap_or_default();
 
+        defmt::info!("scan complete: {} networks", results.len());
+
         if results.is_empty() {
+            defmt::warn!("no networks found");
             bus.fill_screen(WHITE);
             Text::new("No networks found", Point::new(5, 20), text_style)
                 .draw(&mut bus)
@@ -353,6 +361,12 @@ async fn main(_spawner: Spawner) -> ! {
         }
 
         for ap in &results {
+            defmt::info!(
+                "AP ssid={} rssi={} ch={}",
+                ap.ssid.as_str(),
+                ap.signal_strength,
+                ap.channel,
+            );
             bus.fill_screen(WHITE);
 
             let ssid = ap.ssid.as_str();
