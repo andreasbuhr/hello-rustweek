@@ -1,0 +1,19 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "binary": {
+        "path": "/Users/andreasbuhr/.rustup/toolchains/esp/bin/rust-analyzer"
+      },
+      "initialization_options": {
+        "check": {
+          "allTargets": false,
+          "command": "check"
+        },
+        "cargo": {
+          "allTargets": false,
+          "target": "xtensa-esp32s3-none-elf"
+        }
+      }
+    }
+  }
+}

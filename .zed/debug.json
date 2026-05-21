@@ -1,0 +1,57 @@
+// Project-local debug tasks
+//
+// For more documentation on how to configure debug tasks,
+// see: https://zed.dev/docs/debugger
+[
+  {
+    "label": "T-Display",
+    "adapter": "probe-rs",
+    "request": "launch",
+    "chip": "esp32s3",
+    "server": "127.0.0.1:3333",
+    "program-binary": "${ZED_WORKTREE_ROOT}/target/xtensa-esp32s3-none-elf/debug/hello-rustweek",
+    "coreConfigs": [
+      {
+        "coreIndex": 0,
+        "rttEnabled": true,
+        "programBinary": "${ZED_WORKTREE_ROOT}/target/xtensa-esp32s3-none-elf/debug/hello-rustweek",
+      },
+    ],
+    "consoleLogLevel": "Debug",
+    "flashingConfig": {
+      "flashingEnabled": true,
+      "haltAfterReset": false,
+      "formatOptions": {
+        //!MODIFY (or remove). Valid values are: 'bin', 'hex', 'elf'(default), 'idf'
+        "binaryFormat": "elf",
+      },
+    },
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+  },
+  // {
+  //   "adapter": "CodeLLDB",
+  //   "label": "Run",
+  //   "build": {
+  //     "label": "Run",
+  //     "command": "cargo",
+  //     "args": ["build"],
+  //     "env": {},
+  //     "cwd": "$ZED_CUSTOM_RUST_MANIFEST_DIRNAME",
+  //     "use_new_terminal": false,
+  //     "allow_concurrent_runs": false,
+  //     "reveal": "always",
+  //     "reveal_target": "dock",
+  //     "hide": "never",
+  //     "tags": [],
+  //     "shell": "system",
+  //     "show_summary": false,
+  //     "show_command": false,
+  //     "save": "none",
+  //     "hooks": [],
+  //   },
+  //   "sourceLanguages": ["rust"],
+  // },
+]
